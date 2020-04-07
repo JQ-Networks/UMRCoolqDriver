@@ -619,7 +619,7 @@ class QQDriver(UMRDriver.BaseDriverMixin):
         @self.bot.on_message()
         async def handle_msg(context):
             message_type = context.get("message_type")
-            chat_id = context.get(f'{message_type}_id')
+            chat_id = context.get(f'{message_type}_id', context.get('user_id'))
             chat_type = self.chat_type_dict[message_type]
 
             self.logger.debug(f'Received message: {str(context)}')
