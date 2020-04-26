@@ -7,8 +7,10 @@ from unified_message_relay.Core.UMRType import UnifiedMessage, MessageEntity, Ch
 from unified_message_relay.Core import UMRDriver
 from unified_message_relay.Core import UMRLogging
 from unified_message_relay.Core.UMRMessageRelation import set_ingress_message_id, set_egress_message_id
-from unified_message_relay.Util.Helper import check_attribute, unparse_entities_to_markdown
+from unified_message_relay.Util.Helper import unparse_entities_to_markdown
 from unified_message_relay.Core import UMRConfig
+from typing_extensions import Literal
+from pydantic import Field
 import re
 import os
 
@@ -575,52 +577,51 @@ qq_sface_list = {
 }
 
 
+class QQDriverConfig(UMRConfig.BaseDriverConfig):
+    Base: Literal['QQ']
+    Account: int
+    APIRoot: str
+    ListenIP: str
+    ListenPort: int = Field(8080, ge=0, le=65535)
+    Token: str
+    Secret: str
+    IsPro: bool = False
+    NameforPrivateChat: bool = True
+    NameforGroupChat = True
+
+
+UMRConfig.register_driver_config(QQDriverConfig)
+
+
 class QQDriver(UMRDriver.BaseDriverMixin):
     def __init__(self, name):
+        super().__init__(name)
+
         self.name = name
         self.logger = UMRLogging.get_logger(f'UMRDriver.{self.name}')
         self.logger.debug(f'Started initialization for {self.name}')
 
         self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         self.loop.set_exception_handler(self.handle_exception)
-        self.config: Dict = UMRConfig.config['Driver'][self.name]
+        self.config: QQDriverConfig = UMRConfig.config.Driver[self.name]
 
-        attributes = [
-            ('Account', False, None),
-            ('APIRoot', False, None),
-            ('ListenIP', False, None),
-            ('ListenPort', False, None),
-            ('Token', False, None),
-            ('Secret', False, None),
-            ('NameforPrivateChat', True, True),
-            ('NameforGroupChat', True, True),
-        ]
-        check_attribute(self.config, attributes, self.logger)
-        self.bot = CQHttp(api_root=self.config.get('APIRoot'),
-                          access_token=self.config.get('Token'),
-                          secret=self.config.get('Secret'))
+        self.bot = CQHttp(api_root=self.config.APIRoot,
+                          access_token=self.config.Token,
+                          secret=self.config.Secret)
 
         ##### initializations #####
 
         # get group list
         self.group_list: Dict[int, Dict[int, Dict]] = dict()  # Dict[group_id, Dict[member_id, member_info]]
         # see https://cqhttp.cc/docs/4.13/#/API?id=响应数据23
-        self.is_coolq_pro = self.config.get('IsPro', False)  # todo initialization on startup
+        self.is_coolq_pro = self.config.IsPro  # todo initialization on startup
         self.stranger_list: Dict[int, str] = dict()
-
-        self.chat_type_dict = {
-                'group': ChatType.GROUP,
-                'discuss': ChatType.DISCUSS,
-                'private': ChatType.PRIVATE,
-            }
-
-        self.chat_type_dict_reverse = {v: k for k, v in self.chat_type_dict.items()}
 
         @self.bot.on_message()
         async def handle_msg(context):
             message_type = context.get("message_type")
             chat_id = context.get(f'{message_type}_id', context.get('user_id'))
-            chat_type = self.chat_type_dict[message_type]
+            chat_type = ChatType[message_type]
 
             self.logger.debug(f'Received message: {str(context)}')
 
@@ -640,8 +641,8 @@ class QQDriver(UMRDriver.BaseDriverMixin):
         def run():
             asyncio.set_event_loop(self.loop)
             self.logger.debug(f'Starting Quart server for {self.name}')
-            task = self.bot._server_app.run_task(host=self.config.get('ListenIP'),
-                                                 port=self.config.get('ListenPort'))
+            task = self.bot._server_app.run_task(host=self.config.ListenIP,
+                                                 port=self.config.ListenPort)
 
             self.loop.create_task(task)
             self.loop.run_forever()
@@ -672,15 +673,14 @@ class QQDriver(UMRDriver.BaseDriverMixin):
             self.logger.warning(f'Sending to undefined group or chat {to_chat}')
             return
 
-        _chat_type = self.chat_type_dict_reverse[chat_type]
-        context['message_type'] = _chat_type
+        context['message_type'] = f'{chat_type}'
         context['message'] = list()
         if message.image:
             image_name = os.path.basename(message.image)
             context['message'].append(MessageSegment.image(image_name))
 
-        if (_chat_type == 'private' and self.config['NameforPrivateChat']) or \
-                (_chat_type in ('group', 'discuss') and self.config['NameforGroupChat']):
+        if (chat_type == ChatType.PRIVATE and self.config.NameforPrivateChat) or \
+                (chat_type in (ChatType.GROUP, ChatType.DISCUSS) and self.config.NameforGroupChat):
             # name logic
             if message.chat_attrs.name:
                 context['message'].append(MessageSegment.text(message.chat_attrs.name))
@@ -696,12 +696,12 @@ class QQDriver(UMRDriver.BaseDriverMixin):
                 context['message'].append(MessageSegment.at(message.send_action.user_id))
                 context['message'].append(MessageSegment.text(' '))
 
-        context['message'].append(MessageSegment.text(message.message))
+        context['message'].append(MessageSegment.text(message.text))
 
-        if _chat_type == 'private':
+        if chat_type == ChatType.PRIVATE:
             context['user_id'] = to_chat
         else:
-            context[f'{_chat_type}_id'] = to_chat
+            context[f'{chat_type}_id'] = to_chat
         self.logger.debug('finished processing message, ready to send')
         result = await self.bot.send(context, context['message'])
         if message.chat_attrs:
@@ -713,12 +713,12 @@ class QQDriver(UMRDriver.BaseDriverMixin):
                                   dst_chat_id=to_chat,
                                   dst_chat_type=chat_type,
                                   dst_message_id=result.get('message_id'),
-                                  user_id=self.config['Account'])
+                                  user_id=self.config.Account)
         self.logger.debug('finished sending')
         return result.get('message_id')
 
     async def get_username(self, user_id: int, chat_id: int, chat_type: ChatType):
-        if user_id == self.config['Account']:
+        if user_id == self.config.Account:
             return 'bot'
         if user_id == 1000000:
             return 'App message'
@@ -744,9 +744,9 @@ class QQDriver(UMRDriver.BaseDriverMixin):
         #     message = UnifiedMessage(from_platform=self.name, from_chat=group_id, from_user=username,
         #                              message=context.get('raw_message'))
 
-        message_type = context.get('message_type')
-        if message_type in ('group', 'discuss'):
-            chat_id = context.get(f'{message_type}_id')
+        chat_type = ChatType[context.get('message_type')]
+        if chat_type in ('group', 'discuss'):
+            chat_id = context.get(f'{chat_type}_id')
         else:
             chat_id = context.get('user_id')
         user_id = context.get('user_id')
@@ -758,10 +758,10 @@ class QQDriver(UMRDriver.BaseDriverMixin):
             username = user.get('nickname', str(user_id))
         message: List[Dict] = context['message']
 
-        unified_message = await self.parse_special_message(chat_id, self.chat_type_dict[message_type], username, message_id, user_id, message)
+        unified_message = await self.parse_special_message(chat_id, chat_type, username, message_id, user_id, message)
         if unified_message:
             return [unified_message]
-        unified_message_list = await self.parse_message(chat_id, self.chat_type_dict[message_type], username, message_id, user_id, message)
+        unified_message_list = await self.parse_message(chat_id, chat_type, username, message_id, user_id, message)
         return unified_message_list
 
     async def parse_special_message(self, chat_id: int, chat_type: ChatType, username: str, message_id: int, user_id: int,
@@ -778,25 +778,25 @@ class QQDriver(UMRDriver.BaseDriverMixin):
                                          user_id=user_id,
                                          message_id=message_id)
         if message_type == 'share':
-            unified_message.message = 'Shared '
-            unified_message.message_entities.append(
-                MessageEntity(start=len(unified_message.message),
-                              end=len(unified_message.message) + len(message['title']),
+            unified_message.text = 'Shared '
+            unified_message.text_entities.append(
+                MessageEntity(start=len(unified_message.text),
+                              end=len(unified_message.text) + len(message['title']),
                               entity_type=EntityType.LINK,
                               link=message['url']))
-            unified_message.message += message['title']
+            unified_message.text += message['title']
         elif message_type == 'rich':
             if 'url' in message:
                 url = message['url']
                 if url.startswith('mqqapi'):
                     cq_location_regex = re.compile(r'^mqqapi:.*lat=(.*)&lon=(.*)&title=(.*)&loc=(.*)&.*$')
                     locations = cq_location_regex.findall(message['url'])  # [('lat', 'lon', 'name', 'addr')]
-                    unified_message.message = f'Shared a location: {locations[2]}, {locations[3]}, {locations[0]}, {locations[1]}'
+                    unified_message.text = f'Shared a location: {locations[2]}, {locations[3]}, {locations[0]}, {locations[1]}'
                 else:
-                    unified_message.message = message.get('title', message.get('text'))
-                    unified_message.message_entities.append(
+                    unified_message.text = message.get('title', message.get('text'))
+                    unified_message.text_entities.append(
                         MessageEntity(start=0,
-                                      end=len(unified_message.message),
+                                      end=len(unified_message.text),
                                       entity_type=EntityType.LINK,
                                       link=message['url']))
             elif 'title' in message:
@@ -804,75 +804,75 @@ class QQDriver(UMRDriver.BaseDriverMixin):
                     try:
                         content = json.loads(message['content'])
                         if 'news' in content:
-                            unified_message.message = 'Shared '
-                            unified_message.message_entities.append(
-                                MessageEntity(start=len(unified_message.message),
-                                              end=len(unified_message.message) + len(message['title']),
+                            unified_message.text = 'Shared '
+                            unified_message.text_entities.append(
+                                MessageEntity(start=len(unified_message.text),
+                                              end=len(unified_message.text) + len(message['title']),
                                               entity_type=EntityType.LINK,
                                               link=content.get('jumpUrl')))
-                            unified_message.message += message['title'] + ' ' + message.get('desc')
+                            unified_message.text += message['title'] + ' ' + message.get('desc')
                         elif 'weather' in content:
-                            unified_message.message = message['title']
+                            unified_message.text = message['title']
                         else:
                             self.logger.debug(f'Got miscellaneous rich text message with content: {str(message)}')
-                            unified_message.message = message['title']
+                            unified_message.text = message['title']
                     except:
                         self.logger.exception(f'Cannot decode json: {str(message)}')
-                        unified_message.message = message['title']
+                        unified_message.text = message['title']
                 else:
-                    unified_message.message = message['title']
+                    unified_message.text = message['title']
             else:
                 self.logger.debug(f'Got miscellaneous rich text message: {str(message)}')
-                unified_message.message = message.get('text', str(message))
+                unified_message.text = message.get('text', str(message))
         elif message_type == 'dice':
-            unified_message.message = 'Rolled '
-            unified_message.message_entities.append(
-                MessageEntity(start=len(unified_message.message),
-                              end=len(unified_message.message) + len(message['type']),
+            unified_message.text = 'Rolled '
+            unified_message.text_entities.append(
+                MessageEntity(start=len(unified_message.text),
+                              end=len(unified_message.text) + len(message['type']),
                               entity_type=EntityType.BOLD))
-            unified_message.message += message['type']
+            unified_message.text += message['type']
         elif message_type == 'rps':
-            unified_message.message = 'Played '
+            unified_message.text = 'Played '
             played = {'1': 'Rock',
                       '2': 'Scissors',
                       '3': 'Paper'}[message['type']]
-            unified_message.message_entities.append(
-                MessageEntity(start=len(unified_message.message),
-                              end=len(unified_message.message) + len(played),
+            unified_message.text_entities.append(
+                MessageEntity(start=len(unified_message.text),
+                              end=len(unified_message.text) + len(played),
                               entity_type=EntityType.BOLD))
-            unified_message.message += played
+            unified_message.text += played
         elif message_type == 'shake':
-            unified_message.message = 'Sent you a shake'
+            unified_message.text = 'Sent you a shake'
         elif message_type == 'music':
             if message['type'].startswith('163'):
-                unified_message.message = 'Shared a music: '
+                unified_message.text = 'Shared a music: '
                 music_title = 'Netease Music'
-                unified_message.message_entities.append(
-                    MessageEntity(start=len(unified_message.message),
-                                  end=len(unified_message.message) + len(music_title),
+                unified_message.text_entities.append(
+                    MessageEntity(start=len(unified_message.text),
+                                  end=len(unified_message.text) + len(music_title),
                                   entity_type=EntityType.LINK,
                                   link=f'https://music.163.com/song?id={message["id"]}'))
                 unified_message += music_title
             elif message['type'].startswith('qq'):
-                unified_message.message = 'Shared a music: '
+                unified_message.text = 'Shared a music: '
                 music_title = 'Netease Music'
-                unified_message.message_entities.append(
-                    MessageEntity(start=len(unified_message.message),
-                                  end=len(unified_message.message) + len(music_title),
+                unified_message.text_entities.append(
+                    MessageEntity(start=len(unified_message.text),
+                                  end=len(unified_message.text) + len(music_title),
                                   entity_type=EntityType.LINK,
                                   link=f'https://y.qq.com/n/yqq/song/{message["id"]}_num.html'))
                 unified_message += music_title
             else:
                 self.logger.debug(f'Got unseen music share message: {str(message)}')
-                unified_message.message = 'Shared a music: ' + str(message)
+                unified_message.text = 'Shared a music: ' + str(message)
         elif message_type == 'record':
-            unified_message.message = 'Unsupported voice record, please view on QQ'
+            unified_message.text = 'Unsupported voice record, please view on QQ'
         elif message_type == 'bface':
-            unified_message.message = 'Unsupported big face, please view on QQ'
+            unified_message.text = 'Unsupported big face, please view on QQ'
         elif message_type == 'sign':
             unified_message.image = message['image']
             sign_text = f'Sign at location: {message["location"]} with title: {message["title"]}'
-            unified_message.message = sign_text
+            unified_message.text = sign_text
         else:
             return
 
@@ -892,7 +892,7 @@ class QQDriver(UMRDriver.BaseDriverMixin):
             m = m['data']
             if message_type == 'image':
                 # message not empty or contained a image, append to list
-                if unified_message.message or unified_message.image:
+                if unified_message.text or unified_message.image:
                     message_list.append(unified_message)
                     unified_message = UnifiedMessage(platform=self.name,
                                                      chat_id=chat_id,
@@ -903,27 +903,27 @@ class QQDriver(UMRDriver.BaseDriverMixin):
                 unified_message.image = m['url']
 
             elif message_type == 'text':
-                unified_message.message += m['text']
+                unified_message.text += m['text']
             elif message_type == 'at':
                 target = await self.get_username(int(m['qq']), chat_id, chat_type)
                 at_user_text = '@' + target
-                unified_message.message_entities.append(
-                    MessageEntity(start=len(unified_message.message),
-                                  end=len(unified_message.message) + len(at_user_text),
+                unified_message.text_entities.append(
+                    MessageEntity(start=len(unified_message.text),
+                                  end=len(unified_message.text) + len(at_user_text),
                                   entity_type=EntityType.BOLD))
-                unified_message.message += at_user_text
+                unified_message.text += at_user_text
             elif message_type == 'sface':
                 qq_face = int(m['id']) & 255
                 if qq_face in qq_sface_list:
-                    unified_message.message += qq_sface_list[qq_face]
+                    unified_message.text += qq_sface_list[qq_face]
                 else:
-                    unified_message.message += '\u2753'  # ❓
+                    unified_message.text += '\u2753'  # ❓
             elif message_type == 'face':
                 qq_face = int(m['id'])
                 if qq_face in qq_emoji_list:
-                    unified_message.message += qq_emoji_list[qq_face]
+                    unified_message.text += qq_emoji_list[qq_face]
                 else:
-                    unified_message.message += '\u2753'  # ❓
+                    unified_message.text += '\u2753'  # ❓
             else:
                 self.logger.debug(f'Unhandled message type: {str(m)} with type: {message_type}')
 
