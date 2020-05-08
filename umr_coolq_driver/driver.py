@@ -621,7 +621,7 @@ class QQDriver(UMRDriver.BaseDriverMixin):
         async def handle_msg(context):
             message_type = context.get("message_type")
             chat_id = context.get(f'{message_type}_id', context.get('user_id'))
-            chat_type = ChatType[message_type]
+            chat_type = ChatType(message_type)
 
             self.logger.debug(f'Received message: {str(context)}')
 
@@ -744,7 +744,7 @@ class QQDriver(UMRDriver.BaseDriverMixin):
         #     message = UnifiedMessage(from_platform=self.name, from_chat=group_id, from_user=username,
         #                              message=context.get('raw_message'))
 
-        chat_type = ChatType[context.get('message_type')]
+        chat_type = ChatType(context.get('message_type'))
         if chat_type in ('group', 'discuss'):
             chat_id = context.get(f'{chat_type}_id')
         else:
